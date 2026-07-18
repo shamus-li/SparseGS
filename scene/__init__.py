@@ -80,9 +80,10 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
-            transform, center, up, low, high, z_low, z_high, ts, t_thetas = setup_ellipse_sampling(self.train_cameras[resolution_scale])       
-            self.ellipse_params[resolution_scale] = {"transform": transform, "center": center, "up": up, "low": low, "high": high, "z_low": z_low, "z_high": z_high, "ts": ts, "t_thetas": t_thetas}
-            if mode != 'eval':
+            needs_extra_cameras = mode != 'eval' and (args.lambda_diffusion > 0 or args.lambda_reg > 0)
+            if needs_extra_cameras:
+                transform, center, up, low, high, z_low, z_high, ts, t_thetas = setup_ellipse_sampling(self.train_cameras[resolution_scale])
+                self.ellipse_params[resolution_scale] = {"transform": transform, "center": center, "up": up, "low": low, "high": high, "z_low": z_low, "z_high": z_high, "ts": ts, "t_thetas": t_thetas}
             # # Rotate around average up vector
                 train_cam_list = self.train_cameras[resolution_scale]
                 num_poses = len(train_cam_list)
