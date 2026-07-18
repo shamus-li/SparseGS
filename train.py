@@ -35,7 +35,7 @@ except ImportError:
 
     
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step, max_cameras, prune_sched):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step, max_cameras, prune_sched, balanced_camera_sampler, train_all_cameras, anchor_camera_name, aux_camera_loss_weight):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -53,7 +53,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
+    train_cameras = scene.getTrainCameras()
+    anchor_camera = None
+    aux_cameras = []
+    if anchor_camera_name:
+        if not train_all_cameras:
+            raise ValueError("--anchor_camera_name requires --train_all_cameras")
+        if aux_camera_loss_weight < 0.0:
+            raise ValueError("--aux_camera_loss_weight must be non-negative")
+        anchor_stem = os.path.splitext(os.path.basename(anchor_camera_name))[0]
+        matches = [cam for cam in train_cameras if cam.image_name == anchor_stem]
+        if len(matches) != 1:
+            names = ", ".join(cam.image_name for cam in train_cameras)
+            raise ValueError(f"Expected exactly one anchor camera named {anchor_stem!r}; found {len(matches)} in [{names}]")
+        anchor_camera = matches[0]
+        aux_cameras = [cam for cam in train_cameras if cam is not anchor_camera]
+        print(f"Anchor camera: {anchor_camera.image_name}; aux cameras: {[cam.image_name for cam in aux_cameras]}; aux loss weight: {aux_camera_loss_weight}")
     viewpoint_stack = None
+    viewpoint_cycle = []
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -96,13 +113,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_idxs = list(np.arange(len(viewpoint_stack)))
-        rand = randint(0, len(viewpoint_stack)-1)
-        viewpoint_cam = viewpoint_stack.pop(rand)
-        viewpoint_idx = viewpoint_idxs.pop(rand)
+        # Pick a camera. The balanced sampler keeps the original 3k SparseGS
+        # schedule while ensuring each train camera appears once per cycle.
+        if balanced_camera_sampler:
+            if not viewpoint_cycle:
+                viewpoint_cycle = list(np.random.permutation(len(train_cameras)))
+            viewpoint_idx = viewpoint_cycle.pop()
+            viewpoint_cam = train_cameras[viewpoint_idx]
+        else:
+            if not viewpoint_stack:
+                viewpoint_stack = train_cameras.copy()
+            viewpoint_idxs = list(np.arange(len(viewpoint_stack)))
+            rand = randint(0, len(viewpoint_stack)-1)
+            viewpoint_cam = viewpoint_stack.pop(rand)
+            viewpoint_idx = viewpoint_idxs.pop(rand)
 
 
 
@@ -132,28 +156,64 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
-        gt_image = viewpoint_cam.original_image.cuda()
-
-        # Loss
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-
-       
         diffusion_loss = None
         lp_loss = None
         reg_loss = None
         pearson_loss = None
+        render_records = []
 
-        if dataset.lambda_pearson > 0 and (not pick_warp_cam):
-            pearson_loss = pearson_depth_loss(depth.squeeze(0), viewpoint_cam.depth)
-            loss += dataset.lambda_pearson * pearson_loss
-        
-        if dataset.lambda_local_pearson > 0 and (not pick_warp_cam):
-            lp_loss = local_pearson_loss(depth.squeeze(0), viewpoint_cam.depth, dataset.box_p, dataset.p_corr)
-            loss += dataset.lambda_local_pearson * lp_loss
-        
+        if train_all_cameras:
+            Ll1 = torch.zeros((), device="cuda")
+            loss = torch.zeros((), device="cuda")
+            pearson_terms = []
+            lp_terms = []
+            for train_cam in train_cameras:
+                if anchor_camera is None:
+                    loss_scale = 1.0 / len(train_cameras)
+                elif train_cam is anchor_camera:
+                    loss_scale = 1.0
+                elif aux_cameras:
+                    loss_scale = aux_camera_loss_weight / len(aux_cameras)
+                else:
+                    loss_scale = 0.0
+                render_pkg = render(train_cam, gaussians, pipe, bg)
+                image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
+                gt_image = train_cam.original_image.cuda()
+                cam_l1 = l1_loss(image, gt_image)
+                cam_loss = (1.0 - opt.lambda_dssim) * cam_l1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+                if dataset.lambda_pearson > 0 and (not pick_warp_cam):
+                    term = pearson_depth_loss(depth.squeeze(0), train_cam.depth)
+                    pearson_terms.append(term)
+                    cam_loss += dataset.lambda_pearson * term
+                if dataset.lambda_local_pearson > 0 and (not pick_warp_cam):
+                    term = local_pearson_loss(depth.squeeze(0), train_cam.depth, dataset.box_p, dataset.p_corr)
+                    lp_terms.append(term)
+                    cam_loss += dataset.lambda_local_pearson * term
+                Ll1 += cam_l1 * loss_scale
+                loss += cam_loss * loss_scale
+                render_records.append((viewspace_point_tensor, visibility_filter, radii))
+            if pearson_terms:
+                pearson_loss = torch.stack(pearson_terms).mean()
+            if lp_terms:
+                lp_loss = torch.stack(lp_terms).mean()
+        else:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+            image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["depth"]
+            gt_image = viewpoint_cam.original_image.cuda()
+
+            # Loss
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+            if dataset.lambda_pearson > 0 and (not pick_warp_cam):
+                pearson_loss = pearson_depth_loss(depth.squeeze(0), viewpoint_cam.depth)
+                loss += dataset.lambda_pearson * pearson_loss
+
+            if dataset.lambda_local_pearson > 0 and (not pick_warp_cam):
+                lp_loss = local_pearson_loss(depth.squeeze(0), viewpoint_cam.depth, dataset.box_p, dataset.p_corr)
+                loss += dataset.lambda_local_pearson * lp_loss
+            render_records.append((viewspace_point_tensor, visibility_filter, radii))
+
         if pick_diff_cam:
             diffusion_loss = guidance_sd.train_step(diff_image.unsqueeze(0), dataset.step_ratio)
             loss += dataset.lambda_diffusion * diffusion_loss
@@ -161,7 +221,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if pick_warp_cam:
             reg_Ll1 = mask_l1_loss(warp_image, reg_gt_image, reg_mask)
             reg_loss = (1.0 - opt.lambda_dssim) * reg_Ll1 + opt.lambda_dssim * (1.0 - ssim(warp_image, reg_gt_image))
-            loss += dataset.lambda_reg * reg_loss 
+            loss += dataset.lambda_reg * reg_loss
 
         loss.backward()
         iter_end.record()
@@ -209,8 +269,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Densification
             if iteration < opt.densify_until_iter and (not pick_warp_cam):
                 # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                for viewspace_point_tensor, visibility_filter, radii in render_records:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -444,6 +505,10 @@ if __name__ == "__main__":
     parser.add_argument("--step", type=int, default=1)
     parser.add_argument("--max_cameras", type=int, default=None)
     parser.add_argument("--prune_sched", nargs="+", type=int, default=[])
+    parser.add_argument("--balanced_camera_sampler", action="store_true")
+    parser.add_argument("--train_all_cameras", action="store_true")
+    parser.add_argument("--anchor_camera_name", type=str, default="")
+    parser.add_argument("--aux_camera_loss_weight", type=float, default=1.0)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -456,7 +521,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.step, args.max_cameras, args.prune_sched)
+    training(dataset, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.step, args.max_cameras, args.prune_sched, args.balanced_camera_sampler, args.train_all_cameras, args.anchor_camera_name, args.aux_camera_loss_weight)
 
     # All done
     print("\nTraining complete.")
