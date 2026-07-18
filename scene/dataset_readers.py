@@ -71,6 +71,24 @@ def getNerfppNorm(cam_info):
     return {"translate": translate, "radius": radius}
 
 
+def fill_degenerate_radius_from_points(nerf_normalization, point_cloud):
+    if point_cloud is None or nerf_normalization["radius"] > 1e-6:
+        return nerf_normalization
+
+    points = np.asarray(point_cloud.points)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if points.size == 0:
+        return nerf_normalization
+
+    center = np.median(points, axis=0)
+    distances = np.linalg.norm(points - center, axis=1)
+    radius = float(np.percentile(distances, 90) * 1.1)
+    if radius > 1e-6:
+        nerf_normalization = dict(nerf_normalization)
+        nerf_normalization["radius"] = radius
+    return nerf_normalization
+
+
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, step=1, max_cameras=None, load_depth=True):
     cam_infos = []
     holdout_infos = []
@@ -241,6 +259,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, step=1, max_cameras=None
         pcd = fetchPly(ply_path)
     except:
         pcd = None
+    nerf_normalization = fill_degenerate_radius_from_points(nerf_normalization, pcd)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
